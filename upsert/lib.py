@@ -1,14 +1,14 @@
 from typing import Callable
-from pydantic import BaseModel
 from loguru import logger
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 import psutil
 import os
 import asyncio
-from typing import Coroutine
+from typing import Coroutine, TypeVar
 from xml.etree import ElementTree
 from functools import reduce
 import requests
+from psycopg2.extensions import connection as PostgresConnection
 
 
 def _memory_in_mb(memory: int) -> int:
@@ -32,12 +32,17 @@ def get_urls(sitemap_url: str) -> list[str]:
     return urls
 
 
+T = TypeVar("T")
+
+
 @logger.catch(reraise=True)
-async def crawl_parallel(
-    urls: list[str],
+async def upsert_parallel(
+    db_conn: PostgresConnection,
     crawl_func: Callable[
-        [str, AsyncWebCrawler, CrawlerRunConfig, str], Coroutine[None, None, BaseModel]
+        [str, AsyncWebCrawler, CrawlerRunConfig, str], Coroutine[None, None, T]
     ],
+    upsert_func: Callable[[PostgresConnection, T], Coroutine[None, None, None]],
+    urls: list[str] = [],
     max_concurrent: int = 3,
 ):
     peak_memory = 0
@@ -79,7 +84,7 @@ async def crawl_parallel(
                 tasks.append(task)
 
             log_memory(prefix=f"Before batch {i//max_concurrent + 1}: ")
-            results: list[BaseException | BaseModel] = await asyncio.gather(
+            results: list[BaseException | T] = await asyncio.gather(
                 *tasks, return_exceptions=True
             )
             log_memory(prefix=f"After batch {i//max_concurrent + 1}: ")
@@ -89,7 +94,8 @@ async def crawl_parallel(
                     logger.error(f"Error crawling {url}: {result}")
                     fail_count += 1
                 else:
-                    logger.info(f"Success crawling {url}: {result}")
+                    logger.debug(f"Success crawling {url}")
+                    await upsert_func(db_conn, result)
                     success_count += 1
     finally:
         await crawler.close()

@@ -4,8 +4,12 @@ from crawl4ai import (
     CrawlerRunConfig,
 )
 from pydantic import BaseModel
-from lib import get_urls, crawl_parallel
 from loguru import logger
+from datetime import datetime
+import psycopg2
+from config.settings import get_settings
+from .lib import get_urls, upsert_parallel
+from psycopg2.extensions import connection as PostgresConnection
 
 
 class JornalDaUspArticle(BaseModel):
@@ -13,7 +17,10 @@ class JornalDaUspArticle(BaseModel):
     content: str
     author: str
     url: str
-    date: str
+    date: datetime
+
+
+settings = get_settings()
 
 
 async def get_jornal_da_usp_article(page_markdown: str, url: str) -> JornalDaUspArticle:
@@ -24,13 +31,13 @@ async def get_jornal_da_usp_article(page_markdown: str, url: str) -> JornalDaUsp
     try:
         author = extra_splited[1].split("Por ")[1].split(",")[0].strip()
     except IndexError:
-        author = ""
+        author = "Jornal da USP"
 
-    # The article is usually between "Publicado" (which tells the date) and "_______________"
     article_markdown = page_markdown.split("Publicado")[1].split("Política de uso")[0]
     article_splited = article_markdown.splitlines()
-    date = article_splited[0].split(": ")[1].strip()
     content = "\n".join(article_splited[3:])
+    date_str = article_splited[0].split(": ")[1].strip()
+    date = datetime.strptime(date_str, "%d/%m/%Y às %H:%M")
 
     return JornalDaUspArticle(
         title=title,
@@ -64,13 +71,40 @@ async def crawl_jornal_da_usp_article(
         raise Exception(f"Error crawling {url}: {crawl_result}")
 
 
+async def upsert_jornal_da_usp_article(
+    db_conn: PostgresConnection,
+    article: JornalDaUspArticle,
+) -> None:
+    logger.info(f"Upserting article {article.title} from {article.author}")
+    with db_conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO jornal_da_usp_articles (title, content, author, url, date)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                article.title,
+                article.content,
+                article.author,
+                article.url,
+                article.date,
+            ),
+        )
+        try:
+            db_conn.commit()
+        except Exception as e:
+            db_conn.rollback()
+            raise RuntimeError(f"Error upserting article {article.title}: {e}")
+
+
 async def dev():
     crawler = AsyncWebCrawler()
     await crawler.start()
     crawl_config = CrawlerRunConfig(disable_cache=True)
     session_id = "jornal-da-usp"
     article = await crawl_jornal_da_usp_article(
-        "https://jornal.usp.br/articulistas/jose-roberto-castilho-piqueira/maneiras-de-olhar-e-pensar/",
+        "https://jornal.usp.br/comunicados/usp-aprimora-ensino-da-odontologia-com-novos-laboratorios-e-espaco-sensorial-na-fo/",
         crawler,
         crawl_config,
         session_id,
@@ -81,9 +115,16 @@ async def dev():
 
 
 async def main():
-    urls = get_urls("https://jornal.usp.br/post-sitemap.xml")
-    await crawl_parallel(urls, crawl_jornal_da_usp_article, max_concurrent=10)
+    urls = get_urls("https://jornal.usp.br/post-sitemap.xml")[:15]
+    with psycopg2.connect(settings.postgres.url) as db_conn:
+        await upsert_parallel(
+            db_conn,
+            crawl_func=crawl_jornal_da_usp_article,
+            upsert_func=upsert_jornal_da_usp_article,
+            urls=urls,
+            max_concurrent=3,
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(dev())
