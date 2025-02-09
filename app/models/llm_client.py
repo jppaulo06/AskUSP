@@ -1,4 +1,4 @@
-from typing import Any, Type, TypeVar
+from typing import Any, TypeVar, AsyncGenerator
 import instructor
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
@@ -14,16 +14,16 @@ class LLMClient:
         self.provider_settings = LLMSettings
         self.client = self._initialize_client()
 
-    async def create_completion(
-        self, response_model: Type[T], messages: list[dict[str, str]], **kwargs
-    ) -> T:
-        return await self.client.chat.completions.create(
+    def create_partial(
+        self, response_model: type[T], messages: list[dict[str, str]], **kwargs
+    ) -> AsyncGenerator[T, None]:
+        return self.client.chat.completions.create_partial(
             model=kwargs.get("model", self.provider_settings.default_model),
+            messages=messages,
             temperature=kwargs.get("temperature", self.provider_settings.temperature),
             max_retries=kwargs.get("max_retries", self.provider_settings.max_retries),
             max_tokens=kwargs.get("max_tokens", self.provider_settings.max_tokens),
             response_model=response_model,
-            messages=messages,
         )
 
     def _initialize_client(self) -> Instructor:

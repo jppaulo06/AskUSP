@@ -7,8 +7,17 @@ import psycopg2
 from psycopg2.extensions import connection as PostgresConnection
 from .models.synthesizer import Synthesizer
 from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, Field
 
 settings = get_settings()
+
+
+class SynthesizedResponse(BaseModel):
+    enough_context: bool = Field(
+        description="Whether the assistant has enough context to answer the question"
+    )
+    answer: str = Field(description="The synthesized answer to the user's question")
 
 
 SYSTEM_PROMPT = """
@@ -23,9 +32,50 @@ Você é um assistente virtual que fornece informações sobre notícias recente
 5. Não invente ou infira informações não presentes no contexto fornecido.
 6. Se não puder responder à pergunta com base no contexto fornecido, declare claramente isso.
 7. Mantenha um tom útil e profissional apropriado para o atendimento ao cliente.
+8. Indique as fontes de onde as informações foram extraídas, apontando pelo menos a url da notícia.
+9. Escreva em português claro e correto, utilizando Markdown.
 
 Responda à pergunta do usuário:
 """
+
+
+def cache_answer(conn: PostgresConnection, question: str, answer: str) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO answers_cache (question, answer)
+            VALUES (%s, %s)
+            ON CONFLICT (question) DO UPDATE SET answer = EXCLUDED.answer
+            """,
+            (question, answer),
+        )
+        conn.commit()
+        logger.debug("Answer cached.")
+
+
+def get_cached_answer(conn: PostgresConnection, question: str) -> Optional[str]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            WITH query_embedding AS (
+                SELECT ai.openai_embed('text-embedding-3-small', %s) AS qe
+            )
+            SELECT answer
+            FROM answers_cache_embedding_oai_small_v3, query_embedding
+            WHERE (embedding <=> qe) < 0.2
+            ORDER BY embedding <=> qe
+            LIMIT 1;
+            """,
+            (question,),
+        )
+        result = cursor.fetchone()
+
+        if result:
+            logger.debug("Cached answer found.")
+            return result[0]
+
+        logger.debug("No cached answer found.")
+        return None
 
 
 def semantic_search(
@@ -33,16 +83,18 @@ def semantic_search(
 ) -> pd.DataFrame:
     with conn.cursor() as cursor:
         search_query = """
-            SELECT 
-            chunk,
-            to_char(date, 'DD/MM/YYYY'),
-            url,
-            author,
-            title
-            FROM jornal_da_usp_articles_embedding_oai_small_v3
-            ORDER BY embedding <=> (
-                SELECT ai.openai_embed('text-embedding-3-small', %s)
+            WITH query_embedding AS (
+                SELECT ai.openai_embed('text-embedding-3-small', %s) AS qe
             )
+            SELECT 
+                chunk,
+                to_char(date, 'DD/MM/YYYY'),
+                url,
+                author,
+                title
+            FROM jornal_da_usp_articles_embedding_oai_small_v3, query_embedding
+            WHERE (embedding <=> qe) < 0.4
+            ORDER BY embedding <=> qe
             LIMIT %s;
         """
         try:
@@ -58,14 +110,21 @@ def semantic_search(
 
 
 async def main():
-    synthesizer = Synthesizer(settings.openai, SYSTEM_PROMPT)
+    synthesizer = Synthesizer(settings.openai, SYSTEM_PROMPT, SynthesizedResponse)
     conn: PostgresConnection = psycopg2.connect(settings.postgres.url)
 
-    question = "Quais são as notícias recentes da USP, considerando que hoje é 8 de fevereiro de 2025?"
+    question = "O que você pode me dizer sobre a vacinação contra a COVID-19 na USP?"
     search = f"""
     Dia e hora da pergunta: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
     Pergunta do usuário: {question}
     """
+
+    cached_answer = get_cached_answer(conn, question)
+    if cached_answer:
+        logger.info("Cached answer found.")
+        logger.info(cached_answer)
+        return
+
     context = semantic_search(conn, search)
 
     for i, row in context.iterrows():
@@ -76,16 +135,17 @@ async def main():
         logger.info(f"Título: {row['Título']}")
         logger.info("\n")
 
-    response = await synthesizer.generate_response(question, context)
-    logger.debug(response)
+    response = None
 
-    if response.enough_context:
-        logger.info(f"Answer: {response.answer}")
-    else:
-        logger.info("Insufficient context to answer the question.")
-        logger.info("Thought process:")
-        for thought in response.thought_process:
-            logger.info(thought)
+    async for partial in synthesizer.generate_response(question, context):
+        logger.info(f"Partial enough context: {partial.enough_context}")
+        logger.info(f"Partial answer: {partial.answer}")
+        response = partial
+
+    if response:
+        answer = response
+        logger.info(f"Final answer: {answer}")
+        cache_answer(conn, question, answer.answer)
 
     conn.close()
 
